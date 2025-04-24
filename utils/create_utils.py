@@ -1,7 +1,12 @@
-from ..models.all import PromptVersion, PromptVariable, Prompt, PromptMessage, PromptTag
-from ..models.pd.base import PromptVariableBaseModel, PromptMessageBaseModel, PromptTagBaseModel
-from ..models.pd.create import PromptCreateModel, PromptVersionCreateModel, PromptVersionLatestCreateModel
-from typing import Generator, List
+from ..models.all import PromptVersion, PromptVariable, Prompt, PromptMessage
+from typing import Generator, List, Type
+from jinja2 import Environment, DebugUndefined, meta
+
+from ..models.pd.prompt_message import PromptMessageBaseModel
+from ..models.pd.prompt_variable import PromptVariableBaseModel
+from ..models.pd.prompt_version import PromptVersionCreateModel, PromptVersionLatestCreateModel
+from ...promptlib_shared.models.all import Tag
+from ...promptlib_shared.models.pd.base import TagBaseModel
 
 
 def create_variable(
@@ -51,31 +56,41 @@ def create_messages(
 
 
 def get_existing_tags(
-        tags: List[PromptTagBaseModel],
+        tags: List[TagBaseModel],
         session=None,
         project_id: int | None = None
-) -> dict[str, PromptTag]:
+) -> dict[str, Tag]:
     assert session or project_id, 'session or project_id is required'
     if not session and project_id:
         from tools import db
         with db.with_project_schema_session(project_id) as project_session:
-            existing_tags: List[PromptTag] = project_session.query(PromptTag).filter(
-                PromptTag.name.in_({i.name for i in tags})
+            existing_tags: List[Tag] = project_session.query(Tag).filter(
+                Tag.name.in_({i.name for i in tags})
             ).all()
     else:
-        existing_tags: List[PromptTag] = session.query(PromptTag).filter(
-            PromptTag.name.in_({i.name for i in tags})
+        existing_tags: List[Tag] = session.query(Tag).filter(
+            Tag.name.in_({i.name for i in tags})
         ).all()
     return {i.name: i for i in existing_tags}
 
 
 def generate_tags(
-        tags: List[PromptTagBaseModel],
-        existing_tags_map: dict[str, PromptTag]
-) -> Generator[PromptTag, None, None]:
+        tags: List[TagBaseModel],
+        existing_tags_map: dict[str, Tag]
+) -> Generator[Tag, None, None]:
     for i in tags:
-        yield existing_tags_map.get(i.name, PromptTag(**i.dict()))
+        yield existing_tags_map.get(i.name, Tag(**i.dict()))
 
+
+def find_vars_from_context(version):
+    environment = Environment(undefined=DebugUndefined)
+    ast = environment.parse(version.context)
+    version_vars = [] if not version.variables else version.variables
+    context_vars = set(meta.find_undeclared_variables(ast))
+    version_vars = set(var.name for var in version_vars)
+    empty_vars = context_vars - version_vars
+    return [PromptVariableBaseModel(name=var) for var in empty_vars]
+    
 
 def create_version(
         version_data: PromptVersionCreateModel | PromptVersionLatestCreateModel,
@@ -88,6 +103,12 @@ def create_version(
     ))
     if prompt:
         prompt_version.prompt = prompt
+
+    variables = find_vars_from_context(version_data)
+    if version_data.variables:
+        version_data.variables.extend(variables)
+    else:
+        version_data.variables = variables
 
     create_variables(version_data.variables, prompt_version=prompt_version, session=session)
     create_messages(version_data.messages, prompt_version=prompt_version, session=session)
@@ -105,9 +126,9 @@ def create_version(
     return prompt_version
 
 
-def create_prompt(prompt_data: PromptCreateModel, session=None) -> Prompt:
+def create_prompt(prompt_data: Type['PromptCreateModel'] | Type['PromptImportModel'], session=None) -> Prompt:
     prompt = Prompt(
-        **prompt_data.dict(exclude_unset=True, exclude={"versions"})
+        **prompt_data.dict(exclude_unset=True, exclude={"versions", 'collection_id'})
     )
 
     for ver in prompt_data.versions:

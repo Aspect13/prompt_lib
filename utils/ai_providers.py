@@ -1,3 +1,5 @@
+from typing import Optional
+
 from tools import rpc_tools
 from pylon.core.tools import log
 
@@ -11,8 +13,8 @@ class AIProvider:
 
     @classmethod
     def get_integration_settings(
-        cls, project_id: int, integration_uid: str, prompt_settings: dict
-    ) -> dict:
+            cls, project_id: int, integration_uid: str, prompt_settings: dict
+    ) -> Optional[dict]:
         if not prompt_settings:
             prompt_settings = {}
         try:
@@ -27,7 +29,7 @@ class AIProvider:
         integration = cls.rpc.integrations_get_by_uid(
             integration_uid=integration_uid,
             project_id=project_id,
-            check_all_projects=False
+            check_all_projects=True
         )
         if integration is None:
             raise IntegrationNotFound(
@@ -46,10 +48,79 @@ class AIProvider:
         rpc_func = cls._get_rpc_function(integration.name)
         settings = {**integration.settings, **request_settings}
         if integration.name == 'ai_dial':
-            result = rpc_func(project_id, settings, prompt_struct, **kwargs) # TODO: remove when we add kwargs to all rpc functions
+            result = rpc_func(project_id, settings, prompt_struct,
+                              **kwargs)  # TODO: remove when we add kwargs to all rpc functions
         else:
+            if isinstance(prompt_struct, list):
+                # So, our integrations (except ai_dial) ...
+                # ... always try to construct their own message list
+                # Need to give them legacy prompt structure for now
+                prompt_struct = cls._make_legacy_prompt_struct(prompt_struct)
             result = rpc_func(project_id, settings, prompt_struct)
         return result
+
+    @staticmethod
+    def _make_legacy_prompt_struct(list_prompt_struct):
+        # Step A: make conversation
+        conversation = {
+            "context": [],
+            "examples": [],
+            "chat_history": [],
+            "input": []
+        }
+        #
+        for idx, message in enumerate(list_prompt_struct):
+            if message["role"] == "system" and not message.get("name"):
+                conversation["context"].append(message)
+            if message.get("name") in ("example_user", "example_assistant"):
+                conversation["examples"].append(message)
+            if message["role"] == "user" and idx != len(list_prompt_struct) - 1:
+                conversation["chat_history"].append(message)
+            if message["role"] == "assistant":
+                conversation["chat_history"].append(message)
+        #
+        if list_prompt_struct[-1]["role"] == "user":
+            conversation["input"].append(list_prompt_struct[-1])
+        # Step B: make legacy prompt struct
+        # - context
+        context = "\n".join([
+            item["content"] for item in conversation["context"]
+        ])
+        # - examples
+        examples = []
+        example = None
+        #
+        for item in conversation["examples"]:
+            if example is None:
+                example = {}
+            #
+            if item["name"] == "example_user":
+                example["input"] = item["content"]
+            else:
+                example["output"] = item["content"]
+            #
+            if "input" in example and "output" in example:
+                examples.append(example)
+                example = None
+        #
+        if example is not None:
+            examples.append(example)
+        # - chat_history
+        chat_history = []
+        #
+        for item in conversation["chat_history"]:
+            chat_history.append(item)  # Should work as-is
+        # - prompt
+        prompt = "\n".join([
+            item["content"] for item in conversation["input"]
+        ])
+        # - result
+        return {
+            "context": context,
+            "examples": examples,
+            "chat_history": chat_history,
+            "prompt": prompt,
+        }
 
     @classmethod
     def parse_settings(cls, integration, settings):

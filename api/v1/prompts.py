@@ -1,18 +1,20 @@
 import json
-from flask import request, g
-from pydantic import ValidationError
-from typing import List
+
+from flask import request
+from pydantic.v1 import ValidationError
 
 from pylon.core.tools import web, log
 from tools import api_tools, config as c, db, auth
-from ...models.all import Prompt, PromptVersion, PromptTag
-from ...models.pd.create import PromptCreateModel
-from ...models.pd.detail import PromptDetailModel, PromptVersionDetailModel
-from ...models.pd.list import PromptListModel, PromptTagListModel
+
+from ...models.enums.events import PromptEvents
+from ...models.pd.misc import MultiplePromptListModel
+from ...models.pd.prompt import PromptDetailModel, PromptCreateModel
+from ...models.pd.prompt_version import PromptVersionDetailModel
+from ...models.pd.search import SearchDataModel
 
 from ...utils.constants import PROMPT_LIB_MODE
 from ...utils.create_utils import create_prompt
-from ...utils.prompt_utils import list_prompts
+from ...utils.prompt_utils import list_prompts_api
 from ...utils.prompt_utils_legacy import prompts_create_prompt
 
 
@@ -27,7 +29,7 @@ class ProjectAPI(api_tools.APIModeHandler):
         }
     )
     def get(self, project_id):
-        log.info("Getting all prompts for project %s", project_id)
+        # log.info("Getting all prompts for project %s", project_id)
         with_versions = request.args.get("versions", "").lower() == "true"
         prompts = self.module.get_all(project_id, with_versions)
 
@@ -51,78 +53,77 @@ class ProjectAPI(api_tools.APIModeHandler):
 
 
 class PromptLibAPI(api_tools.APIModeHandler):
-    def _get_project_id(self, project_id: int | None) -> int:
-        if not project_id:
-            project_id = 0  # todo: get user personal project id here
-        return project_id
 
+    @auth.decorators.check_api(
+        {
+            "permissions": ["models.prompt_lib.prompts.list"],
+            "recommended_roles": {
+                c.ADMINISTRATION_MODE: {"admin": True, "editor": True, "viewer": False},
+                c.DEFAULT_MODE: {"admin": True, "editor": True, "viewer": False},
+            },
+        }
+    )
+    @api_tools.endpoint_metrics
     def get(self, project_id: int | None = None, **kwargs):
-        project_id = self._get_project_id(project_id)
-
-        filters = []
-        if tags := request.args.get('tags'):
-            # # Filtering parameters
-            # tags = request.args.getlist("tags", type=int)
-            if isinstance(tags, str):
-                tags = tags.split(',')
-            filters.append(Prompt.versions.any(PromptVersion.tags.any(PromptTag.id.in_(tags))))
-
-        # Pagination parameters
-        limit = request.args.get("limit", default=10, type=int)
-        offset = request.args.get("offset", default=0, type=int)
-
-        # Sorting parameters
-        sort_by = request.args.get("sort_by", default="created_at")
-        sort_order = request.args.get("sort_order", default="desc")
-
-        # list prompts
-        total, prompts = list_prompts(
-            project_id,
-            limit=limit,
-            offset=offset,
-            sort_by=sort_by,
-            sort_order=sort_order,
-            filters=filters
+        try:
+            payload = request.get_json()
+            search_data = payload.get("search_data")
+            SearchDataModel.validate(search_data)
+        except Exception:
+            search_data = None
+        
+        collection = {
+            "id": request.args.get('collection_id', type=int),
+            "owner_id": request.args.get('collection_owner_id', type=int)
+        }
+        some_result = list_prompts_api(
+            project_id=project_id,
+            tags=request.args.get('tags'),
+            author_id=request.args.get('author_id'),
+            q=request.args.get('query'),
+            limit=request.args.get("limit", default=None,),
+            offset=request.args.get("offset", default=0, type=int),
+            sort_by=request.args.get("sort_by", default="created_at"),
+            sort_order=request.args.get("sort_order", default='desc'),
+            my_liked=request.args.get('my_liked', False),
+            trend_start_period=request.args.get('trend_start_period'),
+            trend_end_period=request.args.get('trend_end_period'),
+            statuses=request.args.get('statuses'),
+            collection=collection,
+            search_data=search_data
         )
-        # parsing
-        all_authors = set()
-        parsed: List[PromptListModel] = []
-        for i in prompts:
-            p = PromptListModel.from_orm(i)
-            # p.author_ids = set()
-            tags = dict()
-            for v in i.versions:
-                for t in v.tags:
-                    tags[t.name] = PromptTagListModel.from_orm(t).dict()
-                p.author_ids.add(v.author_id)
-                all_authors.update(p.author_ids)
-            p.tags = list(tags.values())
-            parsed.append(p)
-
-        users = auth.list_users(user_ids=list(all_authors))
-        user_map = {i["id"]: i for i in users}
-
-        for i in parsed:
-            i.set_authors(user_map)
-
+        parsed = MultiplePromptListModel(prompts=some_result['prompts'])
         return {
-            "rows": [json.loads(i.json(exclude={"author_ids"})) for i in parsed],
-            "total": total
-        },  200
+            'total': some_result['total'],
+            'rows': [
+                json.loads(i.json())
+                for i in parsed.prompts
+            ]
+        }, 200
 
+    @auth.decorators.check_api(
+        {
+            "permissions": ["models.prompt_lib.prompts.create"],
+            "recommended_roles": {
+                c.ADMINISTRATION_MODE: {"admin": True, "editor": True, "viewer": False},
+                c.DEFAULT_MODE: {"admin": True, "editor": True, "viewer": False},
+            },
+        }
+    )
+    @api_tools.endpoint_metrics
     def post(self, project_id: int | None = None, **kwargs):
-        project_id = self._get_project_id(project_id)
-
+        # create prompt
         raw = dict(request.json)
         raw["owner_id"] = project_id
+        author_id = auth.current_user().get("id")
         for version in raw.get("versions", []):
-            version["author_id"] = g.auth.id
+            version["author_id"] = author_id
         try:
             prompt_data = PromptCreateModel.parse_obj(raw)
         except ValidationError as e:
             return e.errors(), 400
 
-        with db.with_project_schema_session(project_id) as session:
+        with db.get_session(project_id) as session:
             prompt = create_prompt(prompt_data, session)
             session.commit()
 
@@ -130,10 +131,13 @@ class PromptLibAPI(api_tools.APIModeHandler):
             result.version_details = PromptVersionDetailModel.from_orm(
                 prompt.versions[0]
             )
-            result.version_details.author = auth.get_user(
-                user_id=result.version_details.author_id
+
+            result = json.loads(result.json())
+            self.module.context.event_manager.fire_event(
+                PromptEvents.prompt_change, result
             )
-            return json.loads(result.json()), 201
+
+            return result, 201
 
 
 class API(api_tools.APIBase):

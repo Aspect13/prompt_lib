@@ -1,31 +1,45 @@
 from datetime import datetime
 from typing import List
 
-from tools import db_tools, db, rpc_tools, config as c
-from pylon.core.tools import log
+from tools import db_tools, db, config as c
 
-from .enums.all import PromptVersionStatus, PromptVersionType, MessageRoles
-from sqlalchemy import Integer, String, DateTime, func, ForeignKey, JSON, Table, Column, UniqueConstraint, MetaData
-from sqlalchemy.orm import Mapped, mapped_column, relationship, backref
+from .enums.all import PromptVersionType, MessageRoles
+from sqlalchemy import Integer, String, DateTime, func, ForeignKey, JSON, Table, Column, UniqueConstraint
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.mutable import MutableDict
+from ...promptlib_shared.models.all import AbstractLikesMixin, Tag
+from ...promptlib_shared.models.enums.all import PublishStatus
 
 
-class Prompt(db_tools.AbstractBaseMixin, db.Base):
+class Prompt(db_tools.AbstractBaseMixin, db.Base, AbstractLikesMixin):
     __tablename__ = 'prompts'
-    __table_args__ = ({'schema': c.POSTGRES_TENANT_SCHEMA},)
+    __table_args__ = (
+        UniqueConstraint('shared_owner_id', 'shared_id', name='_shared_origin'),
+        {'schema': c.POSTGRES_TENANT_SCHEMA},
+    )
+    likes_entity_name: str = 'prompt'
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String, nullable=False)
     description: Mapped[str] = mapped_column(String, nullable=True)
-    versions: Mapped[List['PromptVersion']] = relationship(back_populates='prompt', lazy=True, cascade='all, delete')
+    versions: Mapped[List['PromptVersion']] = relationship(back_populates='prompt', lazy=True,
+                                                           cascade='all, delete',
+                                                           order_by='PromptVersion.created_at.desc()')
     owner_id: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
+    shared_owner_id: Mapped[int] = mapped_column(Integer, nullable=True)
+    shared_id: Mapped[int] = mapped_column(Integer, nullable=True)
+    collections: Mapped[list] = mapped_column(JSONB, nullable=True, default=list)
 
     def get_latest_version(self):
         return next(version for version in self.versions if version.name == 'latest')
 
+
 class PromptVersion(db_tools.AbstractBaseMixin, db.Base):
     __tablename__ = 'prompt_versions'
     __table_args__ = (
+        UniqueConstraint('shared_owner_id', 'shared_id', name='_version_shared_origin'),
         UniqueConstraint('prompt_id', 'name', name='_prompt_name_uc'),
         {'schema': c.POSTGRES_TENANT_SCHEMA},
     )
@@ -36,24 +50,30 @@ class PromptVersion(db_tools.AbstractBaseMixin, db.Base):
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     commit_message: Mapped[str] = mapped_column(String, nullable=True)
     type: Mapped[PromptVersionType] = mapped_column(String(64), nullable=False, default=PromptVersionType.chat)
-    status: Mapped[PromptVersionStatus] = mapped_column(String, nullable=False, default=PromptVersionStatus.draft)
+    status: Mapped[PublishStatus] = mapped_column(String, nullable=False, default=PublishStatus.draft)
     context: Mapped[str] = mapped_column(String, nullable=True)
     author_id: Mapped[int] = mapped_column(Integer, nullable=False)
     variables: Mapped[List['PromptVariable']] = relationship(back_populates='prompt_version', lazy=True,
                                                              cascade='all, delete-orphan')
     messages: Mapped[List['PromptMessage']] = relationship(back_populates='prompt_version', lazy=True,
                                                            cascade='all, delete-orphan', order_by='PromptMessage.id')
-    tags: Mapped[List['PromptTag']] = relationship(secondary=lambda: PromptVersionTagAssociation,
-                                                   backref='prompt_version', lazy='joined')
+    tags: Mapped[List[Tag]] = relationship(secondary=lambda: PromptVersionTagAssociation,
+                                           backref='prompt_version', lazy='joined')
     model_settings: Mapped[dict] = mapped_column(JSON, nullable=True)
     embedding_settings: Mapped[dict] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
+    # reference fields to origin 
+    shared_owner_id: Mapped[int] = mapped_column(Integer, nullable=True)
+    shared_id: Mapped[int] = mapped_column(Integer, nullable=True)
+    conversation_starters: Mapped[dict] = mapped_column(JSON, default=list)
+    welcome_message: Mapped[str] = mapped_column(String, default='')
+    meta: Mapped[dict] = mapped_column(MutableDict.as_mutable(JSONB), default=dict)
 
 
 class PromptVariable(db_tools.AbstractBaseMixin, db.Base):
     __tablename__ = 'prompt_variables'
     __table_args__ = (
-        UniqueConstraint('prompt_version_id', 'name', name='_version_name_uc'),
+        UniqueConstraint('prompt_version_id', 'name', name='_prompt_version_variable_name_uc'),
         {'schema': c.POSTGRES_TENANT_SCHEMA},
     )
 
@@ -82,22 +102,43 @@ class PromptMessage(db_tools.AbstractBaseMixin, db.Base):
     # todo: add order
 
 
-class PromptTag(db_tools.AbstractBaseMixin, db.Base):
-    __tablename__ = 'prompt_tags'
-    __table_args__ = ({'schema': c.POSTGRES_TENANT_SCHEMA},)
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    # prompt_versions: Mapped[List['PromptVersion']] = relationship(secondary=lambda: PromptVersionTagAssociation, lazy=True)
-    name: Mapped[str] = mapped_column(String, nullable=False, unique=True)
-    data: Mapped[dict] = mapped_column(JSON, nullable=True)
-    # from_public = Column(Boolean, nullable=False, default=False)
-
-
-# log.info(f'db.Base.metadata, {db.Base.metadata}')
 PromptVersionTagAssociation = Table(
     'prompt_version_tag_association',
     db.Base.metadata,
     Column('version_id', ForeignKey(f'{c.POSTGRES_TENANT_SCHEMA}.prompt_versions.id')),
-    Column('tag_id', ForeignKey(f'{c.POSTGRES_TENANT_SCHEMA}.prompt_tags.id')),
+    Column('tag_id', ForeignKey(f'{c.POSTGRES_TENANT_SCHEMA}.{Tag.__tablename__}.id')),
     schema=c.POSTGRES_TENANT_SCHEMA
 )
+
+
+class Collection(db_tools.AbstractBaseMixin, db.Base, AbstractLikesMixin):
+    __tablename__ = "prompt_collections"
+    __table_args__ = (
+        UniqueConstraint('shared_owner_id', 'shared_id', name='_collection_shared_origin'),
+        {"schema": c.POSTGRES_TENANT_SCHEMA},
+    )
+    likes_entity_name: str = 'collection'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    description: Mapped[str] = mapped_column(String, nullable=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    author_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    prompts: Mapped[dict] = mapped_column(JSONB, nullable=True)
+    datasources: Mapped[dict] = mapped_column(JSONB, nullable=True)
+    applications: Mapped[dict] = mapped_column(JSONB, nullable=True)
+    status: Mapped[PublishStatus] = mapped_column(String, nullable=False, default=PublishStatus.draft)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
+    # reference fields to origin 
+    shared_owner_id: Mapped[int] = mapped_column(Integer, nullable=True)
+    shared_id: Mapped[int] = mapped_column(Integer, nullable=True)
+    meta: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class SearchRequest(db_tools.AbstractBaseMixin, db.Base):
+    __tablename__ = "search_requests"
+    __table_args__ = (
+        {"schema": c.POSTGRES_TENANT_SCHEMA},
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    search_keyword: Mapped[str] = mapped_column(String, nullable=False)
+    count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)

@@ -2,7 +2,7 @@ from datetime import datetime
 from itertools import groupby
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic.v1 import BaseModel
 
 
 class TokenPD(BaseModel):
@@ -21,7 +21,7 @@ class TokenPD(BaseModel):
 class ModelsConfig(BaseModel):
     token: Optional[TokenPD] = None
     project_id: int
-    personal_project_id: int
+    personal_project_id: int | None
     integrations: list = []
     url: str
 
